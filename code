@@ -1,1 +1,733 @@
+import telebot
+from telebot.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+)
+import random
+import threading
+import time
+import logging
+from enum import Enum
+from typing import Dict, Optional, List
+from dataclasses import dataclass
+from collections import Counter
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ВСТАВЬ СВОЙ ТОКЕН
+BOT_TOKEN = "8349349248:AAEPPrlyeIiN5yffdQDGCq_U6Slwr5sR67k"
+bot = telebot.TeleBot(BOT_TOKEN)
+
+
+@dataclass
+class Player:
+    user_id: int
+    name: str
+    role: Optional[str] = None
+    alive: bool = True
+    night_target: Optional["Player"] = None
+    has_moved: bool = False
+
+
+class GameState(Enum):
+    LOBBY = "lobby"
+    NIGHT = "night"
+    DAY_VOTE = "day_vote"
+
+
+class PlayerRole(Enum):
+    MAFIA = "🖤 Мафия"
+    DETECTIVE = "🕵️ Шериф"
+    DOCTOR = "💉 Доктор"
+    VILLAGER = "👨‍🌾 Мирный житель"
+
+
+class MafiaSession:
+    def __init__(self, chat_id: int, host_id: int):
+        self.chat_id = chat_id
+        self.host_id = host_id
+        self.players: List[Player] = []
+        self.state = GameState.LOBBY
+        self.day_number = 0
+        self.night_mafia_target: Optional[Player] = None
+        self.doctor_saved: Optional[Player] = None
+        self.day_votes: Dict[int, int] = {}
+        self.in_transition: bool = False
+        self.lobby_message_id: Optional[int] = None
+
+    def add_player(self, user_id: int, name: str) -> bool:
+        if any(p.user_id == user_id for p in self.players) or len(self.players) >= 12:
+            return False
+        self.players.append(Player(user_id, name))
+        return True
+
+    def get_player_by_user_id(self, user_id: int) -> Optional[Player]:
+        return next((p for p in self.players if p.user_id == user_id), None)
+
+    def get_alive_players(self) -> List[Player]:
+        return [p for p in self.players if p.alive]
+
+    def get_mafia_players(self) -> List[Player]:
+        return [p for p in self.get_alive_players() if p.role == PlayerRole.MAFIA.value]
+
+    def get_detective(self) -> Optional[Player]:
+        return next((p for p in self.players if p.role == PlayerRole.DETECTIVE.value and p.alive), None)
+
+    def get_doctor(self) -> Optional[Player]:
+        return next((p for p in self.players if p.role == PlayerRole.DOCTOR.value and p.alive), None)
+
+    def get_player_by_number(self, n: int) -> Optional[Player]:
+        alive = self.get_alive_players()
+        return alive[n] if 0 <= n < len(alive) else None
+
+    def assign_roles(self) -> bool:
+        total = len(self.players)
+        if total < 4:
+            return False
+        mafia_count = max(1, total // 3)
+        roles = (
+            [PlayerRole.MAFIA.value] * mafia_count +
+            [PlayerRole.DETECTIVE.value, PlayerRole.DOCTOR.value] +
+            [PlayerRole.VILLAGER.value] * (total - mafia_count - 2)
+        )
+        random.shuffle(roles)
+        for p, r in zip(self.players, roles):
+            p.role = r
+            p.has_moved = False
+        return True
+
+    def all_roles_moved(self) -> bool:
+        if self.state == GameState.NIGHT:
+            mafias = self.get_mafia_players()
+            if any(p.alive and not p.has_moved for p in mafias):
+                return False
+            det = self.get_detective()
+            if det and det.alive and not det.has_moved:
+                return False
+            doc = self.get_doctor()
+            if doc and doc.alive and not doc.has_moved:
+                return False
+            return True
+        elif self.state == GameState.DAY_VOTE:
+            alive_count = len(self.get_alive_players())
+            return len(self.day_votes) == alive_count
+        return False
+
+    def check_game_end(self) -> bool:
+        alive = self.get_alive_players()
+        alive_mafia = len(self.get_mafia_players())
+        alive_villagers = len(alive) - alive_mafia
+
+        if alive_mafia == 0:
+            safe_send(self.chat_id, "🎉 *Мирные победили!*", auto_delete=180)
+            sessions.pop(self.chat_id, None)
+            return True
+
+        if alive_mafia >= alive_villagers:
+            safe_send(self.chat_id, "🖤 *Мафия победила!*", auto_delete=180)
+            sessions.pop(self.chat_id, None)
+            return True
+
+        return False
+
+
+sessions: Dict[int, MafiaSession] = {}
+
+
+
+def delete_later(chat_id: int, message_id: int, delay: int):
+    def worker():
+        time.sleep(delay)
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception as e:
+            logger.error(f"Ошибка удаления сообщения {message_id} в чате {chat_id}: {e}")
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def safe_send(chat_id, text, reply_markup=None, auto_delete: int = 0, retries=1):
+    for _ in range(retries + 1):
+        try:
+            msg = bot.send_message(
+                chat_id,
+                text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+                timeout=30
+            )
+            if auto_delete > 0:
+                delete_later(chat_id, msg.message_id, auto_delete)
+            return msg
+        except Exception as e:
+            logger.error(f"Ошибка отправки {chat_id}: {e}")
+            if "timeout" not in str(e).lower() or _ == retries:
+                break
+            time.sleep(1)
+    return None
+
+
+def safe_pm(user_id, text, reply_markup=None, retries=1):
+    for _ in range(retries + 1):
+        try:
+            bot.send_message(
+                user_id,
+                text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                timeout=30
+            )
+            logger.info(f"✅ ЛС отправлено пользователю {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка ЛС {user_id}: {e}")
+            if "timeout" not in str(e).lower() or _ == retries:
+                break
+            time.sleep(1)
+    return False
+
+
+
+def main_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(
+        KeyboardButton("🚀 Начать"),
+    )
+    kb.row(
+        KeyboardButton("🎮 Новая игра"),
+        KeyboardButton("📊 Состояние")
+    )
+    kb.row(
+        KeyboardButton("ℹ️ Правила"),
+        KeyboardButton("🛑 Завершить"),
+    )
+    return kb
+
+
+def return_main_menu(chat_id):
+    safe_send(chat_id, "🏠 *Главное меню*", main_keyboard(), auto_delete=60)
+
+
+
+def lobby_keyboard():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Войти в игру", callback_data="join_lobby"),
+    )
+    kb.add(
+        InlineKeyboardButton("🚀 Запустить партию", callback_data="start_game")
+    )
+    return kb
+
+
+def create_role_keyboard(players: List[Player], prefix: str):
+    kb = InlineKeyboardMarkup(row_width=2)
+    for i, player in enumerate(players):
+        if prefix == "mafia":
+            icon = "🔫"
+        elif prefix == "det":
+            icon = "🕵️"
+        elif prefix == "doc":
+            icon = "💉"
+        elif prefix == "day":
+            icon = "⚖️"
+        else:
+            icon = "👤"
+        kb.add(
+            InlineKeyboardButton(f"{icon} {player.name}", callback_data=f"{prefix}_{i}")
+        )
+    kb.add(InlineKeyboardButton("⏰ Пропустить ход", callback_data=f"{prefix}_skip"))
+    return kb
+
+
+def get_session_by_player(user_id: int) -> Optional[MafiaSession]:
+    for sess in sessions.values():
+        if sess.get_player_by_user_id(user_id):
+            return sess
+    return None
+
+
+def get_session_by_chat(chat_id: int) -> Optional[MafiaSession]:
+    return sessions.get(chat_id)
+
+
+def format_lobby_text(sess: MafiaSession, host_name: str) -> str:
+    text = (
+        "🎲 *Лобби мафии*\n"
+        f"👑 Ведущий: *{host_name}*\n"
+        f"👥 Игроки: `{len(sess.players)}`/12\n\n"
+    )
+    if sess.players:
+        for i, p in enumerate(sess.players, start=1):
+            text += f"{i}. `{p.name}`\n"
+    else:
+        text += "_Пока никого нет. Ждём игроков..._"
+    return text
+
+
+def update_lobby_message(chat_id, sess: MafiaSession):
+    if sess.state != GameState.LOBBY:
+        return
+    try:
+        host_name = bot.get_chat_member(chat_id, sess.host_id).user.first_name
+    except Exception:
+        host_name = "Хост"
+
+    text = format_lobby_text(sess, host_name)
+
+    if sess.lobby_message_id:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id,
+                sess.lobby_message_id,
+                reply_markup=lobby_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                logger.info("🛠 Лобби‑сообщение не было изменено — это нормально.")
+            else:
+                logger.error(f"Не удалось отредактировать лобби: {e}")
+
+    msg = safe_send(chat_id, text, lobby_keyboard())
+    if msg:
+        sess.lobby_message_id = msg.message_id
+
+
+
+def start_phase_timer(sess: MafiaSession, duration: int):
+    def timer():
+        time.sleep(duration)
+        if sess.chat_id in sessions:
+            next_phase(sess.chat_id)
+    threading.Thread(target=timer, daemon=True).start()
+
+
+def next_phase(chat_id: int):
+    sess = sessions.get(chat_id)
+    if not sess:
+        return
+
+    if sess.in_transition:
+        logger.warning(f"Повторный вызов next_phase пропущен (chat_id={chat_id})")
+        return
+
+    sess.in_transition = True
+    logger.info(f"Переход фазы: {sess.state.value}")
+
+    try:
+        if sess.state == GameState.NIGHT:
+            votes = [
+                p.night_target.user_id
+                for p in sess.get_mafia_players()
+                if p.night_target
+            ]
+            if votes:
+                vote_count = Counter(votes)
+                target_user_id = vote_count.most_common(1)[0][0]
+                sess.night_mafia_target = sess.get_player_by_user_id(target_user_id)
+            else:
+                sess.night_mafia_target = None
+
+            killed = sess.night_mafia_target
+            if killed and killed != sess.doctor_saved:
+                killed.alive = False
+                safe_send(sess.chat_id, f"🌙 *Ночью {sess.day_number} был убит*: `{killed.name}` 💀", auto_delete=180)
+            else:
+                safe_send(sess.chat_id, f"🌙 *Ночь {sess.day_number}: никто не погиб.* 😌", auto_delete=120)
+
+            for p in sess.players:
+                p.night_target = None
+                p.has_moved = False
+
+            sess.night_mafia_target = None
+            sess.doctor_saved = None
+
+            if sess.check_game_end():
+                return
+
+            sess.day_number += 1
+            sess.state = GameState.DAY_VOTE
+            sess.day_votes.clear()
+            alive_players = sess.get_alive_players()
+            safe_send(
+                sess.chat_id,
+                f"☀️ *День {sess.day_number}*\n"
+                f"Начинается обсуждение и голосование.\n\n"
+                f"*Выберите, кого казнить:*",
+                create_role_keyboard(alive_players, "day")
+            )
+
+        elif sess.state == GameState.DAY_VOTE:
+            if sess.all_roles_moved():
+                if sess.day_votes:
+                    vote_count = Counter(sess.day_votes.values())
+                    loser_id = vote_count.most_common(1)[0][0]
+                    loser = next(p for p in sess.players if p.user_id == loser_id)
+                    loser.alive = False
+                    safe_send(
+                        sess.chat_id,
+                        f"⚖️ *День {sess.day_number}: казнён*: `{loser.name}` ({loser.role})",
+                        auto_delete=240
+                    )
+                else:
+                    safe_send(sess.chat_id, f"⚖️ *День {sess.day_number}: никто не казнён.*", auto_delete=120)
+
+                if sess.check_game_end():
+                    return
+
+                sess.state = GameState.NIGHT
+                sess.day_votes.clear()
+
+                alive_players = sess.get_alive_players()
+                for p in sess.players:
+                    p.night_target = None
+                    p.has_moved = False
+
+                for p in sess.players:
+                    if p.role == PlayerRole.MAFIA.value and p.alive:
+                        safe_pm(
+                            p.user_id,
+                            f"🌙 *Ночь {sess.day_number}*\n"
+                            f"🖤 *Мафия*\n"
+                            f"Выберите жертву:",
+                            create_role_keyboard(alive_players, "mafia")
+                        )
+                    elif p.role == PlayerRole.DETECTIVE.value and p.alive:
+                        safe_pm(
+                            p.user_id,
+                            f"🌙 *Ночь {sess.day_number}*\n"
+                            f"🕵️ *Шериф*\n"
+                            f"Выберите игрока для проверки:",
+                            create_role_keyboard(alive_players, "det")
+                        )
+                    elif p.role == PlayerRole.DOCTOR.value and p.alive:
+                        safe_pm(
+                            p.user_id,
+                            f"🌙 *Ночь {sess.day_number}*\n"
+                            f"💉 *Доктор*\n"
+                            f"Выберите, кого лечить:",
+                            create_role_keyboard(alive_players, "doc")
+                        )
+                    else:
+                        safe_pm(
+                            p.user_id,
+                            f"👨‍🌾 *Ночь {sess.day_number}: вы мирный*\n"
+                            f"🌙 Спите спокойно..."
+                        )
+
+                safe_send(sess.chat_id, f"🌙 *Ночь {sess.day_number} началась!* Ходите в ЛС боту.", auto_delete=60)
+                start_phase_timer(sess, 60)
+            else:
+                update_vote_status(sess)
+
+    finally:
+        sess.in_transition = False
+
+
+def update_vote_status(sess: MafiaSession):
+    alive_count = len(sess.get_alive_players())
+    voted_count = len(sess.day_votes)
+    text = (
+        f"☀️ *День {sess.day_number}*\n"
+        f"Проголосовало: `{voted_count}/{alive_count}` игроков."
+    )
+    safe_send(sess.chat_id, text, auto_delete=45)
+
+
+@bot.message_handler(commands=['start'])
+@bot.message_handler(func=lambda m: m.text == "🚀 Начать")
+def start_handler(message):
+    logger.info(f"Получен /start или кнопка Начать от {message.from_user.first_name}")
+    text = (
+        "👋 *Добро пожаловать в мафию!*\n\n"
+        "🎯 Здесь город каждую ночь засыпает, а мафия выходит на охоту.\n\n"
+        "Выберите действие:\n"
+        "• `🎮 Новая игра` — создать лобби\n"
+        "• `ℹ️ Правила` — узнать, как играть\n"
+        "• `📊 Состояние` — посмотреть текущую игру"
+    )
+    safe_send(message.chat.id, text, main_keyboard(), auto_delete=180)
+
+
+@bot.message_handler(func=lambda m: m.text == "📊 Состояние")
+def status_handler(message):
+    chat_id = message.chat.id
+    sess = get_session_by_chat(chat_id)
+    if not sess:
+        safe_send(chat_id, "❌ Сейчас нет активной игры.", main_keyboard(), auto_delete=30)
+        return
+    alive = sess.get_alive_players()
+    text = (
+        "📊 *Состояние игры*\n"
+        f"👥 Всего игроков: `{len(sess.players)}`\n"
+        f"❤️ Живы: `{len(alive)}`\n"
+        f"📍 Фаза: `{sess.state.value}`"
+    )
+    safe_send(chat_id, text, main_keyboard(), auto_delete=60)
+
+
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Правила")
+def rules_handler(message):
+    text = (
+        "📖 *Правила игры «Мафия»*\n\n"
+        "⚠️ *Важно перед началом игры*\n"
+        "Перед тем как начать игру, каждый игрок должен зайти в личные сообщения с ботом и нажать кнопку `🚀 Начать`.\n"
+        "Это необходимо, чтобы бот мог общаться с вами отдельно в роли (мафия, шериф, доктор и т.д.).\n\n"
+        "🎭 *Роли*\n"
+        "• 🖤 *Мафия* — ночью выбирает жертву.\n"
+        "• 🕵️ *Шериф* — ночью проверяет одного игрока: мафия или мирный.\n"
+        "• 💉 *Доктор* — каждую ночь может спасти одного игрока.\n"
+        "• 👨‍🌾 *Мирный житель* — днём голосует и пытается вычислить мафию.\n\n"
+        "🌙 *Ночь*\n"
+        "Все роли делают свой выбор в любое время ночи, не дожидаясь очереди.\n"
+        "Вы можете пропустить ход.\n\n"
+        "☀️ *День*\n"
+        "Город обсуждает события ночи и голосует, кого казнить.\n"
+        "Игрок с наибольшим числом голосов выбывает.\n\n"
+        "🏆 *Победа*\n"
+        "• Мирные побеждают, если все мафии мертвы.\n"
+        "• Мафия побеждает, если мафия по числу не уступает мирным.\n\n"
+        "🎮 Нажмите *«🎮 Новая игра»*, чтобы собрать лобби!"
+    )
+    safe_send(message.chat.id, text, main_keyboard(), auto_delete=240)
+
+
+@bot.message_handler(func=lambda m: m.text == "🛑 Завершить")
+def stop_handler(message):
+    chat_id = message.chat.id
+    sess = get_session_by_chat(chat_id)
+    if not sess or sess.host_id != message.from_user.id:
+        safe_send(chat_id, "❌ Остановить игру может только ведущий.", main_keyboard(), auto_delete=30)
+        return
+    sessions.pop(chat_id, None)
+    safe_send(chat_id, "🛑 Игра завершена.", main_keyboard(), auto_delete=45)
+
+
+@bot.message_handler(func=lambda m: m.text == "🎮 Новая игра")
+def create_lobby(message):
+    logger.info(f"Получена кнопка '🎮 Новая игра' от {message.from_user.first_name}")
+    chat_id = message.chat.id
+
+    old_sess = get_session_by_chat(chat_id)
+    if old_sess:
+        if old_sess.state == GameState.LOBBY:
+            safe_send(
+                chat_id,
+                "⚠️ В этом чате уже есть лобби. Нажмите `📊 Состояние`.",
+                main_keyboard(),
+                auto_delete=30
+            )
+            return
+        elif old_sess.state in (GameState.NIGHT, GameState.DAY_VOTE):
+            safe_send(
+                chat_id,
+                "⚠️ В этом чате уже идёт игра.",
+                main_keyboard(),
+                auto_delete=30
+            )
+            return
+
+    sess = MafiaSession(chat_id, message.from_user.id)
+    sessions[chat_id] = sess
+
+    try:
+        host_name = message.from_user.first_name
+    except Exception:
+        host_name = "Ведущий"
+
+    text = format_lobby_text(sess, host_name)
+    msg = safe_send(chat_id, text, lobby_keyboard())
+    if msg:
+        sess.lobby_message_id = msg.message_id
+
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "join_lobby")
+def join_lobby_callback(call):
+    bot.answer_callback_query(call.id)
+    chat_id = call.message.chat.id
+    sess = get_session_by_chat(chat_id)
+    if not sess or sess.state != GameState.LOBBY:
+        return
+    if sess.add_player(call.from_user.id, call.from_user.first_name):
+        logger.info(f"Игрок {call.from_user.first_name} присоединился")
+        update_lobby_message(chat_id, sess)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "start_game")
+def start_game_callback(call):
+    bot.answer_callback_query(call.id)
+    chat_id = call.message.chat.id
+    sess = get_session_by_chat(chat_id)
+    if not sess or sess.host_id != call.from_user.id or len(sess.players) < 4:
+        bot.answer_callback_query(call.id, "❌ Нужно минимум 4 игрока!", show_alert=True)
+        return
+
+    logger.info("🎮 ИГРА НАЧИНАЕТСЯ!")
+    sess.assign_roles()
+    sess.state = GameState.NIGHT
+    sess.day_number = 1
+
+    alive_players = sess.get_alive_players()
+    for p in sess.players:
+        p.night_target = None
+        p.has_moved = False
+
+    for p in sess.players:
+        if p.role == PlayerRole.MAFIA.value and p.alive:
+            safe_pm(
+                p.user_id,
+                f"🌙 *Ночь 1*\n"
+                f"🖤 *Мафия*\n"
+                f"Выберите жертву:",
+                create_role_keyboard(alive_players, "mafia")
+            )
+        elif p.role == PlayerRole.DETECTIVE.value and p.alive:
+            safe_pm(
+                p.user_id,
+                f"🌙 *Ночь 1*\n"
+                f"🕵️ *Шериф*\n"
+                f"Выберите игрока для проверки:",
+                create_role_keyboard(alive_players, "det")
+            )
+        elif p.role == PlayerRole.DOCTOR.value and p.alive:
+            safe_pm(
+                p.user_id,
+                f"🌙 *Ночь 1*\n"
+                f"💉 *Доктор*\n"
+                f"Выберите, кого лечить:",
+                create_role_keyboard(alive_players, "doc")
+            )
+        else:
+            safe_pm(
+                p.user_id,
+                f"👨‍🌾 *Вы мирный житель.*\n"
+                f"🌙 Спите спокойно..."
+            )
+
+    safe_send(chat_id, "🌙 *Ночь 1 началась!* Ходите в ЛС боту.", auto_delete=60)
+    start_phase_timer(sess, 60)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("mafia_", "det_", "doc_", "day_")))
+def role_callback_handler(call):
+    user_id = call.from_user.id
+    data = call.data
+    sess = get_session_by_player(user_id)
+
+    if not sess:
+        bot.answer_callback_query(call.id, "❌ Вы не участвуете в игре.", show_alert=True)
+        return
+
+    player = sess.get_player_by_user_id(user_id)
+    if not player or not player.alive:
+        bot.answer_callback_query(call.id, "❌ Вы уже выбыли из игры.", show_alert=True)
+        return
+
+    if player.has_moved:
+        bot.answer_callback_query(call.id, "❌ Вы уже сделали выбор.", show_alert=True)
+        return
+
+    parts = data.split("_", 1)
+    if len(parts) < 2:
+        bot.answer_callback_query(call.id, "❌ Ошибка данных.", show_alert=True)
+        return
+
+    role_type = parts[0]
+    idx_str = parts[1]
+
+    if idx_str == "skip":
+        player.has_moved = True
+        safe_pm(user_id, "⏰ Вы пропустили ход.")
+        if sess.all_roles_moved():
+            next_phase(sess.chat_id)
+        bot.answer_callback_query(call.id)
+        return
+
+    try:
+        target_idx = int(idx_str)
+        target = sess.get_player_by_number(target_idx)
+        if not target:
+            safe_pm(user_id, "❌ Игрок не найден.")
+            bot.answer_callback_query(call.id)
+            return
+    except Exception:
+        safe_pm(user_id, "❌ Некорректный выбор.")
+        bot.answer_callback_query(call.id)
+        return
+
+    # 🖤 Мафия — не может убить себя
+    if role_type == "mafia":
+        if sess.state != GameState.NIGHT:
+            safe_pm(user_id, "⏰ Сейчас не ночь или не ход мафии.")
+            bot.answer_callback_query(call.id)
+            return
+        if target.user_id == user_id:
+            safe_pm(user_id, "❌ Вы не можете выбрать себя в качестве жертвы.")
+            bot.answer_callback_query(call.id)
+            return
+        player.night_target = target
+        player.has_moved = True
+        safe_pm(user_id, f"🖤 Вы выбрали цель: *{target.name}*.")
+        if sess.all_roles_moved():
+            next_phase(sess.chat_id)
+        bot.answer_callback_query(call.id)
+
+    # 🕵️ Шериф — не может проверить себя
+    elif role_type == "det":
+        if sess.state != GameState.NIGHT:
+            safe_pm(user_id, "⏰ Сейчас не ночь или не ход шерифа.")
+            bot.answer_callback_query(call.id)
+            return
+        if target.user_id == user_id:
+            safe_pm(user_id, "❌ Вы не можете проверить себя.")
+            bot.answer_callback_query(call.id)
+            return
+        result = "🖤 Мафия!" if target.role == PlayerRole.MAFIA.value else "🤝 Мирный!"
+        player.has_moved = True
+        safe_pm(user_id, f"🔍 *{target.name}*\n{result}")
+        if sess.all_roles_moved():
+            next_phase(sess.chat_id)
+        bot.answer_callback_query(call.id)
+
+    # 💉 Доктор
+    elif role_type == "doc":
+        if sess.state != GameState.NIGHT:
+            safe_pm(user_id, "⏰ Сейчас не ночь или не ход доктора.")
+            bot.answer_callback_query(call.id)
+            return
+        sess.doctor_saved = target
+        player.has_moved = True
+        safe_pm(user_id, f"💉 Вы спасаете: *{target.name}*.")
+        if sess.all_roles_moved():
+            next_phase(sess.chat_id)
+        bot.answer_callback_query(call.id)
+
+    # ⚖️ День — голосование
+    elif role_type == "day":
+        if sess.state != GameState.DAY_VOTE:
+            safe_pm(user_id, "⏰ Сейчас не дневное голосование.")
+            bot.answer_callback_query(call.id)
+            return
+        if user_id in sess.day_votes:
+            safe_pm(user_id, "❌ Вы уже голосовали.")
+            bot.answer_callback_query(call.id)
+            return
+        sess.day_votes[user_id] = target.user_id
+        safe_send(sess.chat_id, f"✅ *{player.name}* голосует за *{target.name}*.", auto_delete=90)
+        if sess.all_roles_moved():
+            next_phase(sess.chat_id)
+        bot.answer_callback_query(call.id)
+
+
+if __name__ == "__main__":
+    logger.info("🤖 Мафия бот запущен. Ожидаем сообщения...")
+    bot.infinity_polling(
+        none_stop=True,
+        timeout=60,
+        allowed_updates=["message", "callback_query"]
+    )
 
