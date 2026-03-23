@@ -88,3 +88,8 @@ Telegram‑бот для игры в «Мафию» в групповом чат
 Пишет сообщение о победителе (Мафия или Мирные).
 
 Удаляет сессию игры.
+
+
+
+<img width="322" height="843" alt="image" src="https://github.com/user-attachments/assets/0861bcdd-c22d-4f2c-8b37-059c54c5b989" />
+
